@@ -1,7 +1,17 @@
 <?php
 /**
  * OAuth2 認可画面テンプレート
+ *
+ * 表示内容は GET 時に検証してセッションへ保持した認可リクエスト由来。
+ * POST では認可の内容(スコープ・リダイレクト先等)をフォームの値として
+ * 読まないため、hidden 入力は「どのセッション内認可リクエストを使うか」
+ * を指す consent_id のみを持つ。
+ *
  * @var \BaserCore\View\BcAdminAppView $this
+ * @var \League\OAuth2\Server\Entities\ClientEntityInterface $client
+ * @var \League\OAuth2\Server\Entities\ScopeEntityInterface[] $scopes
+ * @var \BaserCore\Model\Entity\User $user
+ * @var string $consentId
  */
 $this->BcBaser->setTitle('BcMcp アプリケーション認可');
 ?>
@@ -20,11 +30,11 @@ $this->BcBaser->setTitle('BcMcp アプリケーション認可');
       <div class="permissions mb-3">
         <h4>要求されている権限</h4>
         <ul>
-          <?php if (empty($scope)): ?>
+          <?php if (!$scopes): ?>
             <li>基本的なアクセス権限</li>
           <?php else: ?>
-            <?php foreach(explode(' ', $scope) as $scopeItem): ?>
-              <li><?= h($this->OAuth2->getScopeDescription($scopeItem)) ?></li>
+            <?php foreach($scopes as $scope): ?>
+              <li><?= h($scope->getDescription()?: $scope->getIdentifier()) ?></li>
             <?php endforeach; ?>
           <?php endif; ?>
         </ul>
@@ -37,10 +47,7 @@ $this->BcBaser->setTitle('BcMcp アプリケーション認可');
       </div>
 
       <?= $this->BcAdminForm->create(null, ['type' => 'post']) ?>
-      <?= $this->BcAdminForm->hidden('client_id', ['value' => $clientId]) ?>
-      <?= $this->BcAdminForm->hidden('redirect_uri', ['value' => $redirectUri]) ?>
-      <?= $this->BcAdminForm->hidden('scope', ['value' => $scope]) ?>
-      <?= $this->BcAdminForm->hidden('state', ['value' => $state]) ?>
+      <?= $this->BcAdminForm->hidden('consent_id', ['value' => $consentId]) ?>
 
       <div class="submit section bca-actions">
         <div class="bca-actions__main">

@@ -3,6 +3,9 @@ declare(strict_types=1);
 
 namespace BcMcp\Test\TestCase\Controller;
 
+use BcMcp\Service\RegistrationRateLimiter;
+use Cake\Cache\Cache;
+use Cake\Cache\Engine\FileEngine;
 use Cake\TestSuite\IntegrationTestTrait;
 use Cake\TestSuite\TestCase;
 
@@ -33,6 +36,19 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
                 'Content-Type' => 'application/json'
             ]
         ]);
+
+        // レート制限の枠がテスト間で持ち越されないようにする。アプリの
+        // ブートストラップ前に RegistrationRateLimiter を直接使うテストもあるため、
+        // 未登録の場合はここで登録しておく（RegistrationRateLimiterTest と同じ設定）
+        if (!Cache::getConfig(RegistrationRateLimiter::CACHE_CONFIG)) {
+            Cache::setConfig(RegistrationRateLimiter::CACHE_CONFIG, [
+                'className' => FileEngine::class,
+                'duration' => '+1 hours',
+                'path' => CACHE . 'bc_mcp' . DS,
+                'prefix' => 'bc_mcp_registration_',
+            ]);
+        }
+        Cache::clear(RegistrationRateLimiter::CACHE_CONFIG);
     }
 
     /**
@@ -45,9 +61,9 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         $requestData = [
             'client_name' => 'Test Dynamic Client',
             'redirect_uris' => ['https://example.com/callback'],
-            'grant_types' => ['authorization_code', 'client_credentials'],
+            'grant_types' => ['authorization_code', 'refresh_token'],
             'scope' => 'mcp:read mcp:write',
-            'token_endpoint_auth_method' => 'client_secret_basic',
+            'token_endpoint_auth_method' => 'none',
             'contacts' => ['admin@example.com'],
             'client_uri' => 'https://example.com',
             'logo_uri' => 'https://example.com/logo.png'
@@ -71,7 +87,7 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
 
         // Check required RFC7591 fields
         $this->assertArrayHasKey('client_id', $response);
-        $this->assertArrayHasKey('client_secret', $response);
+        $this->assertArrayNotHasKey('client_secret', $response);
         $this->assertArrayHasKey('registration_access_token', $response);
         $this->assertArrayHasKey('registration_client_uri', $response);
         $this->assertArrayHasKey('client_id_issued_at', $response);
@@ -79,9 +95,9 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         // Check provided fields
         $this->assertEquals('Test Dynamic Client', $response['client_name']);
         $this->assertEquals(['https://example.com/callback'], $response['redirect_uris']);
-        $this->assertEquals(['authorization_code', 'client_credentials'], $response['grant_types']);
+        $this->assertEquals(['authorization_code', 'refresh_token'], $response['grant_types']);
         $this->assertEquals('mcp:read mcp:write', $response['scope']);
-        $this->assertEquals('client_secret_basic', $response['token_endpoint_auth_method']);
+        $this->assertEquals('none', $response['token_endpoint_auth_method']);
         $this->assertEquals(['admin@example.com'], $response['contacts']);
         $this->assertEquals('https://example.com', $response['client_uri']);
         $this->assertEquals('https://example.com/logo.png', $response['logo_uri']);
@@ -98,7 +114,7 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         $requestData = [
             'client_name' => 'Test Config Client',
             'redirect_uris' => ['https://example.com/callback'],
-            'grant_types' => ['client_credentials'],
+            'grant_types' => ['authorization_code'],
             'scope' => 'mcp:read'
         ];
 
@@ -131,7 +147,7 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         $response = json_decode((string)$this->_response->getBody(), true);
         $this->assertEquals('Test Config Client', $response['client_name']);
         $this->assertEquals(['https://example.com/callback'], $response['redirect_uris']);
-        $this->assertEquals(['client_credentials'], $response['grant_types']);
+        $this->assertEquals(['authorization_code'], $response['grant_types']);
         $this->assertEquals('mcp:read', $response['scope']);
     }
 
@@ -146,7 +162,7 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         $requestData = [
             'client_name' => 'Test Update Client',
             'redirect_uris' => ['https://example.com/callback'],
-            'grant_types' => ['client_credentials'],
+            'grant_types' => ['authorization_code'],
             'scope' => 'mcp:read'
         ];
 
@@ -200,7 +216,7 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         $requestData = [
             'client_name' => 'Test Delete Client',
             'redirect_uris' => ['https://example.com/callback'],
-            'grant_types' => ['client_credentials']
+            'grant_types' => ['authorization_code']
         ];
 
         $this->configRequest([
@@ -263,6 +279,82 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
     }
 
     /**
+     * redirect_uris がトップレベルで配列でない場合は 400 になる（TypeError による 500 の退行防止）
+     *
+     * @return void
+     */
+    public function testRegisterWithNonArrayRedirectUrisReturnsBadRequest(): void
+    {
+        $requestData = [
+            'client_name' => 'Non Array Redirect Uris Client',
+            'redirect_uris' => 'not-an-array',
+            'grant_types' => ['authorization_code']
+        ];
+
+        $this->configRequest([
+            'headers' => [
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+
+        $this->post('/bc-mcp/oauth2/register', json_encode($requestData));
+        $this->assertResponseCode(400);
+        $this->assertContentType('application/json');
+
+        $response = json_decode((string)$this->_response->getBody(), true);
+        $this->assertEquals('invalid_client_metadata', $response['error']);
+    }
+
+    /**
+     * 更新（PUT）でも redirect_uris がトップレベルで配列でない場合は 400 になる
+     *
+     * @return void
+     */
+    public function testUpdateWithNonArrayRedirectUrisReturnsBadRequest(): void
+    {
+        // First register a valid client
+        $requestData = [
+            'client_name' => 'Test Update Guard Client',
+            'redirect_uris' => ['https://example.com/callback'],
+            'grant_types' => ['authorization_code']
+        ];
+
+        $this->configRequest([
+            'headers' => [
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+
+        $this->post('/bc-mcp/oauth2/register', json_encode($requestData));
+        $this->assertResponseCode(201);
+
+        $registrationResponse = json_decode((string)$this->_response->getBody(), true);
+        $clientId = $registrationResponse['client_id'];
+        $registrationToken = $registrationResponse['registration_access_token'];
+
+        $updateData = [
+            'redirect_uris' => 'not-an-array',
+        ];
+
+        $this->configRequest([
+            'headers' => [
+                'Authorization' => 'Bearer ' . $registrationToken,
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+
+        $this->put('/bc-mcp/oauth2/register/' . $clientId, json_encode($updateData));
+        $this->assertResponseCode(400);
+        $this->assertContentType('application/json');
+
+        $response = json_decode((string)$this->_response->getBody(), true);
+        $this->assertEquals('invalid_client_metadata', $response['error']);
+    }
+
+    /**
      * Test unsupported grant type
      *
      * @return void
@@ -302,7 +394,7 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
         $requestData = [
             'client_name' => 'Test Client',
             'redirect_uris' => ['https://example.com/callback'],
-            'grant_types' => ['client_credentials']
+            'grant_types' => ['authorization_code']
         ];
 
         $this->configRequest([
@@ -330,6 +422,125 @@ class OAuth2ControllerDynamicClientRegistrationTest extends TestCase
 
         $response = json_decode((string)$this->_response->getBody(), true);
         $this->assertEquals('invalid_token', $response['error']);
+    }
+
+    /**
+     * 上限に達していない状態では通常どおり 201 が返る
+     *
+     * @return void
+     */
+    public function testRegisterReturnsCreatedWhenUnderLimit(): void
+    {
+        $requestData = [
+            'client_name' => 'Under Limit Client',
+            'redirect_uris' => ['https://example.com/callback'],
+            'grant_types' => ['authorization_code']
+        ];
+
+        $this->configRequest([
+            'headers' => [
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+
+        $this->post('/bc-mcp/oauth2/register', json_encode($requestData));
+        $this->assertResponseCode(201);
+    }
+
+    /**
+     * 上限を超えた登録リクエストは 429 になる
+     *
+     * setting.php の BcMcp.registration.maxPerHour はリクエストのたびに
+     * プラグイン設定が再読込されて上書きされてしまうため、テスト内で
+     * Configure::write() しても複数リクエストをまたいで維持できない。
+     * そのため既定値（10件/時）を前提に、RegistrationRateLimiter を直接
+     * 使って上限に達するまでカウントを進めてから検証する。
+     *
+     * @return void
+     */
+    public function testRegisterReturnsTooManyRequestsWhenLimitExceeded(): void
+    {
+        $clientIp = '203.0.113.10';
+        $this->configRequest([
+            'environment' => ['REMOTE_ADDR' => $clientIp],
+            'headers' => [
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+
+        // 既定の上限（10件/時）まで直接カウントを進めておく
+        $rateLimiter = new RegistrationRateLimiter();
+        for ($i = 0; $i < 10; $i++) {
+            $rateLimiter->hit($clientIp);
+        }
+
+        $requestData = [
+            'client_name' => 'Rate Limited Client',
+            'redirect_uris' => ['https://example.com/callback'],
+            'grant_types' => ['authorization_code']
+        ];
+
+        // 上限に達しているため 429 になる
+        $this->post('/bc-mcp/oauth2/register', json_encode($requestData));
+        $this->assertResponseCode(429);
+        $this->assertContentType('application/json');
+
+        $response = json_decode((string)$this->_response->getBody(), true);
+        $this->assertEquals('invalid_request', $response['error']);
+    }
+
+    /**
+     * バリデーションエラーで 400 になった試行はレート制限のカウントに含まれない
+     *
+     * 既定の上限（10件/時）の1つ手前までカウントを進めておき、400 の試行を
+     * 挟んでも正当なリクエストが通ることを確認する（400 の試行がカウントされて
+     * いれば、この時点で上限に達し 429 になってしまうはず）。
+     *
+     * @return void
+     */
+    public function testInvalidRegistrationDoesNotCountTowardRateLimit(): void
+    {
+        $clientIp = '203.0.113.11';
+        $this->configRequest([
+            'environment' => ['REMOTE_ADDR' => $clientIp],
+            'headers' => [
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+
+        // 既定の上限（10件/時）の1つ手前までカウントを進めておく
+        $rateLimiter = new RegistrationRateLimiter();
+        for ($i = 0; $i < 9; $i++) {
+            $rateLimiter->hit($clientIp);
+        }
+
+        // 不正なメタデータで 400 を発生させる（redirect_uris が不正な URI）
+        $invalidRequestData = [
+            'client_name' => 'Invalid Client',
+            'redirect_uris' => ['invalid-uri'],
+            'grant_types' => ['authorization_code']
+        ];
+        $this->post('/bc-mcp/oauth2/register', json_encode($invalidRequestData));
+        $this->assertResponseCode(400);
+
+        // 400 の試行はカウントされないため、まだ1件分の枠が残っており通る
+        $validRequestData = [
+            'client_name' => 'Valid Client After Invalid Attempt',
+            'redirect_uris' => ['https://example.com/callback'],
+            'grant_types' => ['authorization_code']
+        ];
+        $this->configRequest([
+            'environment' => ['REMOTE_ADDR' => $clientIp],
+            'headers' => [
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json'
+            ]
+        ]);
+        $this->post('/bc-mcp/oauth2/register', json_encode($validRequestData));
+        $this->assertResponseCode(201);
     }
 
 }

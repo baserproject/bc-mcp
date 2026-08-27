@@ -9,6 +9,8 @@ use BaserCore\Service\SiteConfigsServiceInterface;
 use BaserCore\Utility\BcApiUtil;
 use BaserCore\Utility\BcContainerTrait;
 use BaserCore\Utility\BcUtil;
+use BcMcp\Service\RegistrationRateLimiter;
+use Cake\Cache\Cache;
 use Cake\Core\Configure;
 use Cake\Core\PluginApplicationInterface;
 use Cake\Log\Log;
@@ -42,6 +44,16 @@ class BcMcpPlugin extends BcPlugin
         if (!Log::getConfig('mcp') && Configure::check('Log.mcp')) {
             Log::setConfig('mcp', Configure::read('Log.mcp'));
         }
+
+        // setting.php の Cache 設定は baser-core の読み込み順の都合で
+        // Cache へ登録されないため、ここで登録する
+        if (!Cache::getConfig(RegistrationRateLimiter::CACHE_CONFIG)
+            && Configure::check('Cache.' . RegistrationRateLimiter::CACHE_CONFIG)) {
+            Cache::setConfig(
+                RegistrationRateLimiter::CACHE_CONFIG,
+                Configure::read('Cache.' . RegistrationRateLimiter::CACHE_CONFIG)
+            );
+        }
     }
 
     /**
@@ -56,7 +68,12 @@ class BcMcpPlugin extends BcPlugin
         /* @var SiteConfigsService $siteConfigsService */
         $siteConfigsService = $this->getService(SiteConfigsServiceInterface::class);
         $oauth2EncKey = base64_encode(random_bytes(32));
-        $siteConfigsService->putEnv('OAUTH2_ENC_KEY', $oauth2EncKey);
+        // 暗号化キーを書けないまま完了させると、OAuth2 が停止した状態で
+        // インストール済みに見えてしまうため、失敗として扱う
+        if (!$siteConfigsService->putEnv('OAUTH2_ENC_KEY', $oauth2EncKey)) {
+            $this->log('OAUTH2_ENC_KEY を config/.env に書き込めませんでした。書き込み権限を確認してください。');
+            return false;
+        }
         $siteConfigsService->putEnv('USE_CORE_API', "true");
         $siteConfigsService->putEnv('USE_CORE_ADMIN_API', "true");
         if (!file_exists(CONFIG . 'jwt.pem')) {

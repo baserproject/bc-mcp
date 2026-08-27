@@ -6,8 +6,11 @@ namespace BcMcp\Test\TestCase\Controller\Admin;
 use BaserCore\Test\Scenario\InitAppScenario;
 use BaserCore\TestSuite\BcTestCase;
 use BcMcp\Mcp\McpContext;
+use BcMcp\Service\RegistrationRateLimiter;
+use Cake\Cache\Cache;
 use Cake\TestSuite\IntegrationTestTrait;
 use Cake\Core\Configure;
+use Cake\Utility\Hash;
 use CakephpFixtureFactories\Scenario\ScenarioAwareTrait;
 
 /**
@@ -64,6 +67,11 @@ class OAuth2ControllerTest extends BcTestCase
                 'HTTPS' => 'off'
             ]
         ]);
+
+        // レート制限の枠がテスト間で持ち越されないようにする
+        if (Cache::getConfig(RegistrationRateLimiter::CACHE_CONFIG)) {
+            Cache::clear(RegistrationRateLimiter::CACHE_CONFIG);
+        }
     }
 
     /**
@@ -112,6 +120,21 @@ class OAuth2ControllerTest extends BcTestCase
 
         $this->configRequest(['headers' => $headers]);
         $this->post('/bc-mcp', json_encode($mcpRequest, JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * 直近の GET で発行された consent_id を取得する
+     *
+     * Server::run() 後の Session::read() はデータを消してしまうため、
+     * $_SESSION を直接参照する（CakePHP 本体の SessionEquals/SessionHasKey
+     * 制約と同様の作法）。
+     *
+     * @return string
+     */
+    private function lastConsentId(): string
+    {
+        $pending = (array)Hash::get($_SESSION, 'BcMcp.authRequests', []);
+        return (string)array_key_last($pending);
     }
 
     /**
@@ -191,6 +214,9 @@ class OAuth2ControllerTest extends BcTestCase
         $metadata = json_decode((string)$this->_response->getBody(), true);
         $registrationEndpoint = $metadata['registration_endpoint'];
 
+        $codeVerifier = 'bc-mcp-test-code-verifier-0123456789012345678901234567';
+        $codeChallenge = rtrim(strtr(base64_encode(hash('sha256', $codeVerifier, true)), '+/', '-_'), '=');
+
         // クライアント登録エンドポイントにPOSTリクエストを送信
         $this->post($registrationEndpoint, [
             'client_name' => 'Test Client',
@@ -198,6 +224,7 @@ class OAuth2ControllerTest extends BcTestCase
             'redirect_uris' => ['http://localhost/callback'],
             'grant_types' => ['authorization_code', 'refresh_token'],
             'response_types' => ['code'],
+            'token_endpoint_auth_method' => 'none',
             'scope' => 'mcp:read mcp:write'
         ]);
         $metadata = json_decode((string)$this->_response->getBody(), true);
@@ -207,29 +234,31 @@ class OAuth2ControllerTest extends BcTestCase
         // 認可リクエスト
         $this->get('/bc-mcp/oauth2/authorize?' . http_build_query([
                 'client_id' => $metadata['client_id'],
-                'client_secret' => $metadata['client_secret'],
                 'response_type' => 'code',
-                'redirect_uri' => $metadata['redirect_uris'][0]
+                'redirect_uri' => $metadata['redirect_uris'][0],
+                'code_challenge' => $codeChallenge,
+                'code_challenge_method' => 'S256',
             ]));
         $this->assertResponseCode(302);
 
         $this->loginAdmin($this->getRequest());
         $this->get('/bc-mcp/oauth2/authorize?' . http_build_query([
                 'client_id' => $metadata['client_id'],
-                'client_secret' => $metadata['client_secret'],
                 'response_type' => 'code',
-                'redirect_uri' => $metadata['redirect_uris'][0]
+                'redirect_uri' => $metadata['redirect_uris'][0],
+                'code_challenge' => $codeChallenge,
+                'code_challenge_method' => 'S256',
             ]));
         $this->assertResponseCode(200);
 
         // 認可承認
-        $this->post('/bc-mcp/oauth2/authorize?' . http_build_query([
-                'grant_type' => 'authorization_code',
-                'client_id' => $metadata['client_id'],
-                'client_secret' => $metadata['client_secret'],
-                'response_type' => 'code',
-                'redirect_uri' => $metadata['redirect_uris'][0]
-            ]), ['action' => 'approve']);
+        // 同意 POST は CSRF 保護下にあり、認可リクエストはセッションから取得される
+        // IntegrationTestTrait は次のリクエストのセッションを都度作り直すため、
+        // GET でセッションに書き込んだ認可リクエストを $_SESSION から引き継ぐ。
+        $consentId = $this->lastConsentId();
+        $this->session($_SESSION);
+        $this->enableCsrfToken();
+        $this->post('/bc-mcp/oauth2/authorize', ['action' => 'approve', 'consent_id' => $consentId]);
         $this->assertResponseCode(302);
         $redirectUrl = $this->_response->getHeaderLine('Location');
         $this->assertStringContainsString('code=', $redirectUrl);
@@ -252,7 +281,7 @@ class OAuth2ControllerTest extends BcTestCase
             'code' => $authCode,
             'redirect_uri' => $metadata['redirect_uris'][0],
             'client_id' => $metadata['client_id'],
-            'client_secret' => $metadata['client_secret'],
+            'code_verifier' => $codeVerifier,
             'scope' => 'read write'
         ]);
         $this->assertResponseCode(200);
@@ -312,11 +341,11 @@ class OAuth2ControllerTest extends BcTestCase
         $this->assertArrayHasKey('result', $blogResponse);
 
         // リフレッシュトークンを使用して新しいアクセストークンを取得
+        // PKCE を使う公開クライアント(token_endpoint_auth_method: none)のため client_secret は送らない
         $this->post('/bc-mcp/oauth2/token', [
             'grant_type' => 'refresh_token',
             'refresh_token' => $refreshToken,
             'client_id' => $metadata['client_id'],
-            'client_secret' => $metadata['client_secret']
         ]);
         $this->assertResponseCode(200);
         $newTokenData = json_decode((string)$this->_response->getBody(), true);
@@ -414,10 +443,13 @@ class OAuth2ControllerTest extends BcTestCase
         $this->assertResponseOk(); // 認可画面が表示される
 
         // Step 5: 認可承認（PKCEパラメータが保存される）
-        $this->post('/bc-mcp/oauth2/authorize?' . http_build_query($authParams), [
-            'action' => 'approve',
-            'scope' => 'mcp:read mcp:write'
-        ]);
+        // 同意 POST は CSRF 保護下にあり、認可リクエストはセッションから取得される
+        // IntegrationTestTrait は次のリクエストのセッションを都度作り直すため、
+        // GET でセッションに書き込んだ認可リクエストを $_SESSION から引き継ぐ。
+        $consentId = $this->lastConsentId();
+        $this->session($_SESSION);
+        $this->enableCsrfToken();
+        $this->post('/bc-mcp/oauth2/authorize', ['action' => 'approve', 'consent_id' => $consentId]);
         $this->assertResponseCode(302);
 
         // リダイレクトURLから認可コードを取得
@@ -580,13 +612,20 @@ class OAuth2ControllerTest extends BcTestCase
             'code_challenge_method' => 'S256'
         ];
 
-        $this->post('/bc-mcp/oauth2/authorize?' . http_build_query($authParams), [
-            'action' => 'approve'
-        ]);
+        $this->get('/bc-mcp/oauth2/authorize?' . http_build_query($authParams));
+        $this->assertResponseOk();
+
+        // 同意 POST は CSRF 保護下にあり、認可リクエストはセッションから取得される
+        $consentId = $this->lastConsentId();
+        $this->session($_SESSION);
+        $this->enableCsrfToken();
+        $this->post('/bc-mcp/oauth2/authorize', ['action' => 'approve', 'consent_id' => $consentId]);
+        $this->assertResponseCode(302);
 
         $redirectUrl = $this->_response->getHeaderLine('Location');
         $queryParams = [];
         parse_str(parse_url($redirectUrl, PHP_URL_QUERY), $queryParams);
+        $this->assertArrayHasKey('code', $queryParams);
         $authCode = $queryParams['code'];
 
         // 正しいcode_verifierでトークン交換（成功するはず）
@@ -612,13 +651,24 @@ class OAuth2ControllerTest extends BcTestCase
             'code_challenge_method' => 'S256'
         ];
 
-        $this->post('/bc-mcp/oauth2/authorize?' . http_build_query($authParams2), [
-            'action' => 'approve'
-        ]);
+        $this->get('/bc-mcp/oauth2/authorize?' . http_build_query($authParams2));
+        $this->assertResponseOk();
 
+        // 同意 POST は CSRF 保護下にあり、認可リクエストはセッションから取得される
+        $consentId2 = $this->lastConsentId();
+        $this->session($_SESSION);
+        $this->enableCsrfToken();
+        $this->post('/bc-mcp/oauth2/authorize', ['action' => 'approve', 'consent_id' => $consentId2]);
+        // ここでアサーションを省略すると、後段のセッション引き継ぎが壊れて
+        // 400 になった場合でも $authCode2 が空のまま次に進んでしまい、
+        // 「PKCE 検証の失敗」ではなく「認可コードが無い」という別の理由で
+        // テストが緑になってしまう。それを防ぐため、302 と code の存在を
+        // ここで明示的に確認する。
+        $this->assertResponseCode(302);
         $redirectUrl2 = $this->_response->getHeaderLine('Location');
         $queryParams2 = [];
         parse_str(parse_url($redirectUrl2, PHP_URL_QUERY), $queryParams2);
+        $this->assertArrayHasKey('code', $queryParams2);
         $authCode2 = $queryParams2['code'];
 
         // 間違ったcode_verifierでトークン交換（失敗するはず）

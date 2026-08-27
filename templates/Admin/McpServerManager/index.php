@@ -12,9 +12,21 @@
  * @var array $protocolVersions
  * @var array $tools
  * @var array $negotiations
+ * @var bool $encryptionKeyMissing
  */
 ?>
 
+
+<?php if ($encryptionKeyMissing): ?>
+  <div class="bca-panel-box">
+    <div class="bca-panel-box__body">
+      <p class="error-message">
+        暗号化キー（OAUTH2_ENC_KEY）が設定されていないため、MCP サーバーは停止しています。
+        <code>config/.env</code> に <code>OAUTH2_ENC_KEY</code> を設定してください。
+      </p>
+    </div>
+  </div>
+<?php endif; ?>
 
 <!-- 接続情報 -->
 <div class="bca-panel-box">
@@ -75,6 +87,18 @@
         <div class="bca-data-list__item-label">手順2</div>
         <div class="bca-data-list__item-value">
           AIエージェントから「ブログ記事を追加して」などの指示でbaserCMSを操作できます
+        </div>
+      </div>
+
+      <div class="bca-data-list__item">
+        <div class="bca-data-list__item-label">接続の要件</div>
+        <div class="bca-data-list__item-value">
+          <ul>
+            <li>認可方式は Authorization Code + PKCE（S256）のみに対応しています</li>
+            <li>クライアントはパブリッククライアント（<code>token_endpoint_auth_method: none</code>）として登録されます</li>
+            <li>リダイレクト先は https、または <code>127.0.0.1</code> / <code>[::1]</code> / <code>localhost</code> の http のみ登録できます</li>
+            <li>クライアント登録は同一のIPアドレスから1時間に10件までです</li>
+          </ul>
         </div>
       </div>
     </div>
